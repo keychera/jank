@@ -45,6 +45,7 @@ option(jank_unity_build "Optimize translation unit compilation for the number of
 option(jank_debug_gc "Enable GC debug assertions" OFF)
 option(jank_profile_gc "Enable GC profiling (via massif or heaptrack)" OFF)
 option(jank_force_phase_2 "Force the linking of core libs into the jank binary" OFF)
+option(jank_only_static_runtime "for building build jank_common_lib and jank_static_lib" OFF)
 set(jank_sanitize "none" CACHE STRING "The type of Clang sanitization to use (or none)")
 set(jank_resource_dir
   "../lib/jank/${CMAKE_PROJECT_VERSION}"
@@ -76,6 +77,9 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   set(jank_link_whole_start "-Wl,-force_load")
   set(jank_link_whole_end "")
 elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+  set(jank_link_whole_start "-Wl,--whole-archive")
+  set(jank_link_whole_end "-Wl,--no-whole-archive")
+elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Emscripten")
   set(jank_link_whole_start "-Wl,--whole-archive")
   set(jank_link_whole_end "-Wl,--no-whole-archive")
 else()
@@ -237,23 +241,33 @@ include(cmake/sanitization.cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 # Also include the system includes in the compile_commands.json so that weird
 # systems like NixOS can have tooling work properly.
-set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
+if(NOT EMSCRIPTEN)
+  set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
+endif()
 
 # ---- Clang/LLVM ----
-include(cmake/llvm.cmake)
+if(jank_only_static_runtime)
+  set(CMAKE_SKIP_INSTALL_RULES ON)
+endif()
 
-if(
-  NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
-  OR
-  NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL CLANG_PACKAGE_VERSION
-)
-  message(
-    FATAL_ERROR
-    "Found Clang ${CLANG_PACKAGE_VERSION} to embed in jank, "
-    "but trying to use ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} to compile it. "
-    "Please ensure you're using the same Clang to compile jank as you are embedding in jank. "
-    "Follow the build.md documentation."
+if(NOT jank_only_static_runtime)
+  include(cmake/llvm.cmake)
+endif()
+
+if(NOT jank_only_static_runtime)
+  if(
+    NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+    OR
+    NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL CLANG_PACKAGE_VERSION
   )
+    message(
+      FATAL_ERROR
+      "Found Clang ${CLANG_PACKAGE_VERSION} to embed in jank, "
+      "but trying to use ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} to compile it. "
+      "Please ensure you're using the same Clang to compile jank as you are embedding in jank. "
+      "Follow the build.md documentation."
+    )
+  endif()
 endif()
 
 # This is needed on macOS to ensure we end up using the correct C++ stdlib.
@@ -422,76 +436,85 @@ set_target_properties(jankzip_lib PROPERTIES ENABLE_EXPORTS 1)
 # a couple of other custom commands, including a command to merge all of the
 # object files seen into the final library.
 
+if(NOT jank_only_static_runtime)
+  if(WIN32) # Use wrapper ar-merge.bat script if on MSYS2
+    configure_file(bin/ar-merge.bat ar-merge.bat USE_SOURCE_PERMISSIONS @ONLY)
+    set(EXT_AR ".bat")
+  else()
+    set(EXT_AR "")
+  endif()
 
-if(WIN32) # Use wrapper ar-merge.bat script if on MSYS2
-  configure_file(bin/ar-merge.bat ar-merge.bat USE_SOURCE_PERMISSIONS @ONLY)
-  set(EXT_AR ".bat")
-else()
-  set(EXT_AR "")
+  configure_file(bin/ar-merge ar-merge USE_SOURCE_PERMISSIONS @ONLY)
+  set(CMAKE_AR "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}")
+  set(jank_standalone_dynamic_lib_deps
+    jank_common_lib
+    jank_compiler_lib
+    jank_dynamic_lib
+    jank_static_lib
+    cpptrace::cpptrace
+    ftxui::screen ftxui::dom
+    Boost::multiprecision
+    nanobench_lib
+    jankzip_lib
+    bdwgc::gc bdwgc::gctba
+    folly_lib
+    clangCppInterOp
+  )
+
+  # jank compiles in two phases. The first phase builds the compiler+runtime into a binary
+  # called jank-phase-1. We then we this compiler to build the core libs (like clojure.core)
+  # into cpp files. We then compile those and link them into a new binary which is just
+  # called jank. This bakes in the core libraries so they're very fast to load, but of
+  # course it means that updating a core library means updating the whole jank binary.
+  #
+  # For debug builds, we don't bother building the second phase and we just create a symlink
+  # called jank which points at jank-phase-1. This makes iteration a little faster, at the
+  # cost of jank's startup being a little slower, since it's loading the core libs via their
+  # object files, rather than having them baked in.
+  add_custom_command(
+    DEPENDS ${jank_standalone_dynamic_lib_deps}
+    OUTPUT ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+    COMMAND "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}" merge-phase-1
+  )
+  add_custom_target(
+    jank_standalone_dynamic_lib_phase_1
+    ALL
+    DEPENDS ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a
+  )
+
+  add_custom_command(
+    DEPENDS ${jank_standalone_dynamic_lib_deps} jank_exe_phase_2
+    OUTPUT ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime.a
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+    COMMAND "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}" merge-phase-2
+  )
+  add_custom_target(
+    jank_standalone_dynamic_lib_phase_2
+    ALL
+    DEPENDS ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime.a
+  )
 endif()
-
-configure_file(bin/ar-merge ar-merge USE_SOURCE_PERMISSIONS @ONLY)
-set(CMAKE_AR "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}")
-set(jank_standalone_dynamic_lib_deps
-  jank_common_lib
-  jank_compiler_lib
-  jank_dynamic_lib
-  jank_static_lib
-  cpptrace::cpptrace
-  ftxui::screen ftxui::dom
-  Boost::multiprecision
-  nanobench_lib
-  jankzip_lib
-  bdwgc::gc bdwgc::gctba
-  folly_lib
-  clangCppInterOp
-)
-
-# jank compiles in two phases. The first phase builds the compiler+runtime into a binary
-# called jank-phase-1. We then we this compiler to build the core libs (like clojure.core)
-# into cpp files. We then compile those and link them into a new binary which is just
-# called jank. This bakes in the core libraries so they're very fast to load, but of
-# course it means that updating a core library means updating the whole jank binary.
-#
-# For debug builds, we don't bother building the second phase and we just create a symlink
-# called jank which points at jank-phase-1. This makes iteration a little faster, at the
-# cost of jank's startup being a little slower, since it's loading the core libs via their
-# object files, rather than having them baked in.
-add_custom_command(
-  DEPENDS ${jank_standalone_dynamic_lib_deps}
-  OUTPUT ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a
-  COMMAND_EXPAND_LISTS
-  VERBATIM
-  COMMAND "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}" merge-phase-1
-)
-add_custom_target(
-  jank_standalone_dynamic_lib_phase_1
-  ALL
-  DEPENDS ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a
-)
-
-add_custom_command(
-  DEPENDS ${jank_standalone_dynamic_lib_deps} jank_exe_phase_2
-  OUTPUT ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime.a
-  COMMAND_EXPAND_LISTS
-  VERBATIM
-  COMMAND "${CMAKE_BINARY_DIR}/ar-merge${EXT_AR}" merge-phase-2
-)
-add_custom_target(
-  jank_standalone_dynamic_lib_phase_2
-  ALL
-  DEPENDS ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime.a
-)
 
 # ---- Other dependencies ----
 # We want all deps built as static libs.
 set(BUILD_SHARED_LIBS OFF)
+# if(EMSCRIPTEN)
+#   add_compile_options(-m64)
+#   add_link_options(-m64)
+#   -m64 will fail compiling bdwgc: https://github.com/bdwgc/bdwgc/blob/39b0d4ecf9bdc65a971e9423f4080d40814da6ce/include/private/gcconfig.h#L2596
+#   bdwgc error: 64-bit WebAssembly is not yet supported
+# endif()
 
 include(FetchContent)
 include(cmake/dependency/bdwgc.cmake)
 include(cmake/dependency/ftxui.cmake)
 include(cmake/dependency/cpptrace.cmake)
-include(cmake/dependency/cppinterop.cmake)
+if(NOT jank_only_static_runtime)
+  include(cmake/dependency/cppinterop.cmake)
+endif()
 include(cmake/dependency/boost-multiprecision.cmake)
 include(cmake/dependency/folly.cmake)
 
@@ -499,7 +522,9 @@ if(jank_test)
   include(cmake/dependency/doctest.cmake)
 endif()
 
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+if(NOT EMSCRIPTEN)
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+endif()
 
 # CMake changed its mechanism for finding Boost. The old behavior uses
 # a CMake-provided FindBoost script. The new behavior relies on locating
@@ -508,7 +533,22 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 if(POLICY CMP0167)
   cmake_policy(SET CMP0167 NEW)
 endif()
-find_package(Boost REQUIRED)
+
+if(EMSCRIPTEN)
+  add_compile_options(-sUSE_BOOST_HEADERS=1)
+  add_link_options(-sUSE_BOOST_HEADERS=1)
+  add_compile_options(-m64)
+  add_link_options(-m64)
+  if(NOT TARGET Boost::boost)
+    add_library(Boost::boost INTERFACE IMPORTED)
+    set_target_properties(Boost::boost PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${EMSCRIPTEN_SYSROOT}/include"
+    )
+  endif()
+else()
+  find_package(Boost REQUIRED)
+endif()
+
 # ---- Other dependencies ----
 
 # ---- libjank-common.a ----
@@ -771,256 +811,258 @@ target_link_options(jank_static_lib PRIVATE ${jank_linker_flags})
 set_target_properties(jank_static_lib PROPERTIES ENABLE_EXPORTS 0)
 # ---- libjank-static.a ----
 
-# ---- libjank-compiler.a ----
-add_library(
-  jank_compiler_lib STATIC
-  src/cpp/jank/ui/highlight.cpp
-  src/cpp/jank/util/clang_format.cpp
-  src/cpp/jank/util/clang.cpp
-  src/cpp/jank/analyze/processor.cpp
-  src/cpp/jank/analyze/expression.cpp
-  src/cpp/jank/analyze/expr/vector.cpp
-  src/cpp/jank/analyze/expr/recursion_reference.cpp
-  src/cpp/jank/analyze/expr/map.cpp
-  src/cpp/jank/analyze/expr/do.cpp
-  src/cpp/jank/analyze/expr/var_deref.cpp
-  src/cpp/jank/analyze/expr/recur.cpp
-  src/cpp/jank/analyze/expr/named_recursion.cpp
-  src/cpp/jank/analyze/expr/local_reference.cpp
-  src/cpp/jank/analyze/expr/def.cpp
-  src/cpp/jank/analyze/expr/let.cpp
-  src/cpp/jank/analyze/expr/letfn.cpp
-  src/cpp/jank/analyze/expr/throw.cpp
-  src/cpp/jank/analyze/expr/if.cpp
-  src/cpp/jank/analyze/expr/list.cpp
-  src/cpp/jank/analyze/expr/primitive_literal.cpp
-  src/cpp/jank/analyze/expr/call.cpp
-  src/cpp/jank/analyze/expr/set.cpp
-  src/cpp/jank/analyze/expr/var_ref.cpp
-  src/cpp/jank/analyze/expr/function.cpp
-  src/cpp/jank/analyze/expr/try.cpp
-  src/cpp/jank/analyze/expr/case.cpp
-  src/cpp/jank/analyze/expr/cpp_raw.cpp
-  src/cpp/jank/analyze/expr/cpp_type.cpp
-  src/cpp/jank/analyze/expr/cpp_value.cpp
-  src/cpp/jank/analyze/expr/cpp_literal.cpp
-  src/cpp/jank/analyze/expr/cpp_conversion.cpp
-  src/cpp/jank/analyze/expr/cpp_unsafe_cast.cpp
-  src/cpp/jank/analyze/expr/cpp_call.cpp
-  src/cpp/jank/analyze/expr/cpp_constructor_call.cpp
-  src/cpp/jank/analyze/expr/cpp_member_call.cpp
-  src/cpp/jank/analyze/expr/cpp_member_access.cpp
-  src/cpp/jank/analyze/expr/cpp_builtin_operator_call.cpp
-  src/cpp/jank/analyze/expr/cpp_box.cpp
-  src/cpp/jank/analyze/expr/cpp_unbox.cpp
-  src/cpp/jank/analyze/expr/cpp_new.cpp
-  src/cpp/jank/analyze/expr/cpp_delete.cpp
-  src/cpp/jank/analyze/local_frame.cpp
-  src/cpp/jank/analyze/step/force_boxed.cpp
-  src/cpp/jank/analyze/cpp_util.cpp
-  src/cpp/jank/analyze/pass/walk.cpp
-  src/cpp/jank/analyze/pass/optimize.cpp
-  src/cpp/jank/analyze/pass/strip_source_meta.cpp
-  src/cpp/jank/ir/processor.cpp
-  src/cpp/jank/ir/instruction.cpp
-  src/cpp/jank/ir/builder.cpp
-  src/cpp/jank/ir/print.cpp
-  src/cpp/jank/ir/dominance.cpp
-  src/cpp/jank/ir/rewrite.cpp
-  src/cpp/jank/ir/util.cpp
-  src/cpp/jank/ir/walk.cpp
-  src/cpp/jank/ir/opt/hoist_scoped_values.cpp
-  src/cpp/jank/ir/opt/hoist_literals.cpp
-  src/cpp/jank/ir/opt/hoist_var_derefs.cpp
-  src/cpp/jank/ir/opt/remove_nops.cpp
-  src/cpp/jank/evaluate.cpp
-  src/cpp/jank/codegen/cpp_processor.cpp
-  src/cpp/jank/codegen/optimize.cpp
-  src/cpp/jank/aot/processor.cpp
+if(NOT jank_only_static_runtime)
+  # ---- libjank-compiler.a ----
+  add_library(
+    jank_compiler_lib STATIC
+    src/cpp/jank/ui/highlight.cpp
+    src/cpp/jank/util/clang_format.cpp
+    src/cpp/jank/util/clang.cpp
+    src/cpp/jank/analyze/processor.cpp
+    src/cpp/jank/analyze/expression.cpp
+    src/cpp/jank/analyze/expr/vector.cpp
+    src/cpp/jank/analyze/expr/recursion_reference.cpp
+    src/cpp/jank/analyze/expr/map.cpp
+    src/cpp/jank/analyze/expr/do.cpp
+    src/cpp/jank/analyze/expr/var_deref.cpp
+    src/cpp/jank/analyze/expr/recur.cpp
+    src/cpp/jank/analyze/expr/named_recursion.cpp
+    src/cpp/jank/analyze/expr/local_reference.cpp
+    src/cpp/jank/analyze/expr/def.cpp
+    src/cpp/jank/analyze/expr/let.cpp
+    src/cpp/jank/analyze/expr/letfn.cpp
+    src/cpp/jank/analyze/expr/throw.cpp
+    src/cpp/jank/analyze/expr/if.cpp
+    src/cpp/jank/analyze/expr/list.cpp
+    src/cpp/jank/analyze/expr/primitive_literal.cpp
+    src/cpp/jank/analyze/expr/call.cpp
+    src/cpp/jank/analyze/expr/set.cpp
+    src/cpp/jank/analyze/expr/var_ref.cpp
+    src/cpp/jank/analyze/expr/function.cpp
+    src/cpp/jank/analyze/expr/try.cpp
+    src/cpp/jank/analyze/expr/case.cpp
+    src/cpp/jank/analyze/expr/cpp_raw.cpp
+    src/cpp/jank/analyze/expr/cpp_type.cpp
+    src/cpp/jank/analyze/expr/cpp_value.cpp
+    src/cpp/jank/analyze/expr/cpp_literal.cpp
+    src/cpp/jank/analyze/expr/cpp_conversion.cpp
+    src/cpp/jank/analyze/expr/cpp_unsafe_cast.cpp
+    src/cpp/jank/analyze/expr/cpp_call.cpp
+    src/cpp/jank/analyze/expr/cpp_constructor_call.cpp
+    src/cpp/jank/analyze/expr/cpp_member_call.cpp
+    src/cpp/jank/analyze/expr/cpp_member_access.cpp
+    src/cpp/jank/analyze/expr/cpp_builtin_operator_call.cpp
+    src/cpp/jank/analyze/expr/cpp_box.cpp
+    src/cpp/jank/analyze/expr/cpp_unbox.cpp
+    src/cpp/jank/analyze/expr/cpp_new.cpp
+    src/cpp/jank/analyze/expr/cpp_delete.cpp
+    src/cpp/jank/analyze/local_frame.cpp
+    src/cpp/jank/analyze/step/force_boxed.cpp
+    src/cpp/jank/analyze/cpp_util.cpp
+    src/cpp/jank/analyze/pass/walk.cpp
+    src/cpp/jank/analyze/pass/optimize.cpp
+    src/cpp/jank/analyze/pass/strip_source_meta.cpp
+    src/cpp/jank/ir/processor.cpp
+    src/cpp/jank/ir/instruction.cpp
+    src/cpp/jank/ir/builder.cpp
+    src/cpp/jank/ir/print.cpp
+    src/cpp/jank/ir/dominance.cpp
+    src/cpp/jank/ir/rewrite.cpp
+    src/cpp/jank/ir/util.cpp
+    src/cpp/jank/ir/walk.cpp
+    src/cpp/jank/ir/opt/hoist_scoped_values.cpp
+    src/cpp/jank/ir/opt/hoist_literals.cpp
+    src/cpp/jank/ir/opt/hoist_var_derefs.cpp
+    src/cpp/jank/ir/opt/remove_nops.cpp
+    src/cpp/jank/evaluate.cpp
+    src/cpp/jank/codegen/cpp_processor.cpp
+    src/cpp/jank/codegen/optimize.cpp
+    src/cpp/jank/aot/processor.cpp
 
-  src/cpp/jank/compiler_native.cpp
-  src/cpp/jank/nrepl/server.cpp
-)
-set_target_properties(jank_compiler_lib PROPERTIES UNITY_BUILD ${jank_unity_build})
-set_property(TARGET jank_compiler_lib PROPERTY OUTPUT_NAME jank-compiler)
-target_compile_features(jank_compiler_lib PUBLIC ${jank_cxx_standard})
-target_compile_options(jank_compiler_lib PUBLIC "$<TARGET_PROPERTY:jank_common_lib,COMPILE_OPTIONS>")
-target_include_directories(jank_compiler_lib SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
-target_link_libraries(
-  jank_compiler_lib PRIVATE
-  clangCppInterOp
-)
-target_link_options(jank_compiler_lib PRIVATE ${jank_linker_flags})
-set_target_properties(jank_compiler_lib PROPERTIES ENABLE_EXPORTS 1)
-# ---- libjank-compiler.a ----
+    src/cpp/jank/compiler_native.cpp
+    src/cpp/jank/nrepl/server.cpp
+  )
+  set_target_properties(jank_compiler_lib PROPERTIES UNITY_BUILD ${jank_unity_build})
+  set_property(TARGET jank_compiler_lib PROPERTY OUTPUT_NAME jank-compiler)
+  target_compile_features(jank_compiler_lib PUBLIC ${jank_cxx_standard})
+  target_compile_options(jank_compiler_lib PUBLIC "$<TARGET_PROPERTY:jank_common_lib,COMPILE_OPTIONS>")
+  target_include_directories(jank_compiler_lib SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
+  target_link_libraries(
+    jank_compiler_lib PRIVATE
+    clangCppInterOp
+  )
+  target_link_options(jank_compiler_lib PRIVATE ${jank_linker_flags})
+  set_target_properties(jank_compiler_lib PROPERTIES ENABLE_EXPORTS 1)
+  # ---- libjank-compiler.a ----
 
-# ---- jank phase 1 executable ----
-add_executable(
-  jank_exe_phase_1
-  src/cpp/main.cpp
-  src/cpp/jank/environment/check_health.cpp
-)
-add_executable(jank::exe ALIAS jank_exe_phase_1)
-set_property(TARGET jank_exe_phase_1 PROPERTY OUTPUT_NAME jank-phase-1)
-jank_hook_llvm(jank_exe_phase_1)
+  # ---- jank phase 1 executable ----
+  add_executable(
+    jank_exe_phase_1
+    src/cpp/main.cpp
+    src/cpp/jank/environment/check_health.cpp
+  )
+  add_executable(jank::exe ALIAS jank_exe_phase_1)
+  set_property(TARGET jank_exe_phase_1 PROPERTY OUTPUT_NAME jank-phase-1)
+  jank_hook_llvm(jank_exe_phase_1)
 
-add_dependencies(jank_exe_phase_1 jank_standalone_dynamic_lib_phase_1)
-set_target_properties(jank_exe_phase_1 PROPERTIES ENABLE_EXPORTS 1)
+  add_dependencies(jank_exe_phase_1 jank_standalone_dynamic_lib_phase_1)
+  set_target_properties(jank_exe_phase_1 PROPERTIES ENABLE_EXPORTS 1)
 
-target_compile_features(jank_exe_phase_1 PRIVATE ${jank_cxx_standard})
-target_compile_options(jank_exe_phase_1
-  PUBLIC
-  ${jank_common_compiler_flags} ${jank_aot_compiler_flags}
-)
-target_include_directories(jank_exe_phase_1 SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
-target_link_directories(jank_exe_phase_1 PRIVATE "$<TARGET_PROPERTY:jank_common_lib,LINK_DIRECTORIES>")
-target_link_options(jank_exe_phase_1 PRIVATE ${jank_linker_flags} -L ${CMAKE_BINARY_DIR})
+  target_compile_features(jank_exe_phase_1 PRIVATE ${jank_cxx_standard})
+  target_compile_options(jank_exe_phase_1
+    PUBLIC
+    ${jank_common_compiler_flags} ${jank_aot_compiler_flags}
+  )
+  target_include_directories(jank_exe_phase_1 SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
+  target_link_directories(jank_exe_phase_1 PRIVATE "$<TARGET_PROPERTY:jank_common_lib,LINK_DIRECTORIES>")
+  target_link_options(jank_exe_phase_1 PRIVATE ${jank_linker_flags} -L ${CMAKE_BINARY_DIR})
 
-target_link_libraries(
-  jank_exe_phase_1 PUBLIC
-  ${jank_link_whole_start} ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a ${jank_link_whole_end}
-  LLVM clang-cpp
-  z
-  OpenSSL::Crypto
-)
-
-if(WIN32)
   target_link_libraries(
     jank_exe_phase_1 PUBLIC
-    ${jank_link_whole_start} libclang_rt.builtins-x86_64.a ${jank_link_whole_end}
-    # Required at least for mkstemp.
-    ${jank_link_whole_start} libmingwex.a ${jank_link_whole_end}
-
-    pthread
-    zstd
-  )
-endif()
-# ---- jank phase 1 executable ----
-
-# ---- jank phase 2 executable ----
-if(jank_enable_phase_2)
-  add_executable(
-    jank_exe_phase_2
-    "$<TARGET_PROPERTY:jank_exe_phase_1,SOURCES>"
-    ${jank_clojure_core_output}
-    ${jank_nrepl_server_outputs}
-  )
-  add_executable(jank::exe ALIAS jank_exe_phase_2)
-  set_property(TARGET jank_exe_phase_2 PROPERTY OUTPUT_NAME jank)
-  jank_hook_llvm(jank_exe_phase_2)
-
-  # Our generated code is not as precisely written as hand-written C++, so we ignore various
-  # warnings and skip linting.
-  set_source_files_properties(${jank_clojure_core_output} ${jank_nrepl_server_outputs} PROPERTIES COMPILE_FLAGS "-w -Wno-c++11-narrowing")
-  set_source_files_properties(${jank_clojure_core_output} ${jank_nrepl_server_outputs} PROPERTIES SKIP_LINTING ON)
-
-  # Symbol exporting for JIT.
-  set_target_properties(jank_exe_phase_2 PROPERTIES ENABLE_EXPORTS 1)
-
-  target_compile_features(jank_exe_phase_2 PRIVATE ${jank_cxx_standard})
-  target_compile_options(jank_exe_phase_2 PUBLIC "$<TARGET_PROPERTY:jank_exe_phase_1,COMPILE_OPTIONS>" -DJANK_PHASE_2)
-  target_include_directories(jank_exe_phase_2 SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,INCLUDE_DIRECTORIES>")
-  target_link_directories(jank_exe_phase_2 PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_DIRECTORIES>")
-  target_link_options(jank_exe_phase_2 PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_OPTIONS>")
-
-  target_link_libraries(
-    jank_exe_phase_2 PUBLIC
-    "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_LIBRARIES>"
-  )
-
-  add_dependencies(jank_exe_phase_2 jank_core_libraries)
-else()
-  add_custom_command(
-    DEPENDS ${CMAKE_BINARY_DIR}/jank-phase-1${CMAKE_EXECUTABLE_SUFFIX} ${jank_clojure_core_output} ${jank_nrepl_server_outputs} ${jank_incremental_pch_flag}
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    OUTPUT ${CMAKE_BINARY_DIR}/jank
-    COMMAND ${CMAKE_COMMAND} -E create_symlink jank-phase-1${CMAKE_EXECUTABLE_SUFFIX} jank${CMAKE_EXECUTABLE_SUFFIX}
-  )
-  add_custom_target(
-    jank_exe_phase_2
-    ALL
-    DEPENDS ${CMAKE_BINARY_DIR}/jank
-  )
-endif()
-# ---- jank phase 2 executable ----
-
-# ---- Tests ----
-if(jank_test)
-  add_executable(
-    jank_test_exe
-    test/cpp/main.cpp
-    test/cpp/jtl/immutable_string.cpp
-    test/cpp/jtl/string_builder.cpp
-    test/cpp/jank/util/fmt.cpp
-    test/cpp/jank/util/path.cpp
-    test/cpp/jank/read/lex.cpp
-    test/cpp/jank/read/parse.cpp
-    test/cpp/jank/runtime/behavior/call.cpp
-    test/cpp/jank/runtime/core/seq.cpp
-    test/cpp/jank/runtime/detail/native_persistent_list.cpp
-    test/cpp/jank/runtime/obj/big_integer.cpp
-    test/cpp/jank/runtime/obj/big_decimal.cpp
-    test/cpp/jank/runtime/obj/persistent_string.cpp
-    test/cpp/jank/runtime/obj/ratio.cpp
-    test/cpp/jank/runtime/obj/persistent_list.cpp
-    test/cpp/jank/runtime/obj/persistent_string.cpp
-    test/cpp/jank/runtime/obj/persistent_vector.cpp
-    test/cpp/jank/runtime/obj/persistent_array_map.cpp
-    test/cpp/jank/runtime/obj/transient_array_map.cpp
-    test/cpp/jank/runtime/obj/range.cpp
-    test/cpp/jank/runtime/obj/integer_range.cpp
-    test/cpp/jank/runtime/obj/repeat.cpp
-    test/cpp/jank/jit/processor.cpp
-  )
-  add_executable(jank::test_exe ALIAS jank_test_exe)
-  add_dependencies(jank_test_exe jank_core_libraries)
-  jank_hook_llvm(jank_test_exe)
-
-  if(jank_enable_phase_2)
-    target_sources(jank_test_exe PUBLIC ${jank_clojure_core_output})
-    target_compile_options(jank_test_exe PUBLIC -DJANK_PHASE_2)
-  endif()
-
-  set_property(TARGET jank_test_exe PROPERTY OUTPUT_NAME jank-test)
-
-  target_compile_features(jank_test_exe PRIVATE ${jank_cxx_standard})
-  # TODO: Check if this is still needed.
-  # A doctest issue causes some warnings: https://github.com/doctest/doctest/issues/900
-  target_compile_options(jank_test_exe PUBLIC ${jank_common_compiler_flags} ${jank_aot_compiler_flags} "-Wno-#warnings")
-  target_compile_options(jank_test_exe PRIVATE -DDOCTEST_CONFIG_SUPER_FAST_ASSERTS)
-  target_include_directories(jank_test_exe SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
-  target_link_directories(jank_test_exe PRIVATE "$<TARGET_PROPERTY:jank_common_lib,LINK_DIRECTORIES>")
-  target_link_options(jank_test_exe PRIVATE ${jank_linker_flags} -L ${CMAKE_BINARY_DIR})
-
-  target_link_libraries(
-    jank_test_exe PUBLIC
     ${jank_link_whole_start} ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a ${jank_link_whole_end}
-    z
     LLVM clang-cpp
+    z
     OpenSSL::Crypto
-    doctest::doctest
   )
 
   if(WIN32)
     target_link_libraries(
-      jank_test_exe PUBLIC
+      jank_exe_phase_1 PUBLIC
       ${jank_link_whole_start} libclang_rt.builtins-x86_64.a ${jank_link_whole_end}
-      # Required at least for mkstemp
+      # Required at least for mkstemp.
       ${jank_link_whole_start} libmingwex.a ${jank_link_whole_end}
 
       pthread
       zstd
     )
   endif()
+  # ---- jank phase 1 executable ----
 
-  # Symbol exporting for JIT.
-  set_target_properties(jank_test_exe PROPERTIES ENABLE_EXPORTS 1)
+  # ---- jank phase 2 executable ----
+  if(jank_enable_phase_2)
+    add_executable(
+      jank_exe_phase_2
+      "$<TARGET_PROPERTY:jank_exe_phase_1,SOURCES>"
+      ${jank_clojure_core_output}
+      ${jank_nrepl_server_outputs}
+    )
+    add_executable(jank::exe ALIAS jank_exe_phase_2)
+    set_property(TARGET jank_exe_phase_2 PROPERTY OUTPUT_NAME jank)
+    jank_hook_llvm(jank_exe_phase_2)
 
-  add_dependencies(jank_test_exe jank_exe_phase_2)
+    # Our generated code is not as precisely written as hand-written C++, so we ignore various
+    # warnings and skip linting.
+    set_source_files_properties(${jank_clojure_core_output} ${jank_nrepl_server_outputs} PROPERTIES COMPILE_FLAGS "-w -Wno-c++11-narrowing")
+    set_source_files_properties(${jank_clojure_core_output} ${jank_nrepl_server_outputs} PROPERTIES SKIP_LINTING ON)
 
-  add_test(NAME "Test" COMMAND jank_test_exe)
+    # Symbol exporting for JIT.
+    set_target_properties(jank_exe_phase_2 PROPERTIES ENABLE_EXPORTS 1)
+
+    target_compile_features(jank_exe_phase_2 PRIVATE ${jank_cxx_standard})
+    target_compile_options(jank_exe_phase_2 PUBLIC "$<TARGET_PROPERTY:jank_exe_phase_1,COMPILE_OPTIONS>" -DJANK_PHASE_2)
+    target_include_directories(jank_exe_phase_2 SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,INCLUDE_DIRECTORIES>")
+    target_link_directories(jank_exe_phase_2 PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_DIRECTORIES>")
+    target_link_options(jank_exe_phase_2 PRIVATE "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_OPTIONS>")
+
+    target_link_libraries(
+      jank_exe_phase_2 PUBLIC
+      "$<TARGET_PROPERTY:jank_exe_phase_1,LINK_LIBRARIES>"
+    )
+
+    add_dependencies(jank_exe_phase_2 jank_core_libraries)
+  else()
+    add_custom_command(
+      DEPENDS ${CMAKE_BINARY_DIR}/jank-phase-1${CMAKE_EXECUTABLE_SUFFIX} ${jank_clojure_core_output} ${jank_nrepl_server_outputs} ${jank_incremental_pch_flag}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+      OUTPUT ${CMAKE_BINARY_DIR}/jank
+      COMMAND ${CMAKE_COMMAND} -E create_symlink jank-phase-1${CMAKE_EXECUTABLE_SUFFIX} jank${CMAKE_EXECUTABLE_SUFFIX}
+    )
+    add_custom_target(
+      jank_exe_phase_2
+      ALL
+      DEPENDS ${CMAKE_BINARY_DIR}/jank
+    )
+  endif()
+  # ---- jank phase 2 executable ----
+
+  # ---- Tests ----
+  if(jank_test)
+    add_executable(
+      jank_test_exe
+      test/cpp/main.cpp
+      test/cpp/jtl/immutable_string.cpp
+      test/cpp/jtl/string_builder.cpp
+      test/cpp/jank/util/fmt.cpp
+      test/cpp/jank/util/path.cpp
+      test/cpp/jank/read/lex.cpp
+      test/cpp/jank/read/parse.cpp
+      test/cpp/jank/runtime/behavior/call.cpp
+      test/cpp/jank/runtime/core/seq.cpp
+      test/cpp/jank/runtime/detail/native_persistent_list.cpp
+      test/cpp/jank/runtime/obj/big_integer.cpp
+      test/cpp/jank/runtime/obj/big_decimal.cpp
+      test/cpp/jank/runtime/obj/persistent_string.cpp
+      test/cpp/jank/runtime/obj/ratio.cpp
+      test/cpp/jank/runtime/obj/persistent_list.cpp
+      test/cpp/jank/runtime/obj/persistent_string.cpp
+      test/cpp/jank/runtime/obj/persistent_vector.cpp
+      test/cpp/jank/runtime/obj/persistent_array_map.cpp
+      test/cpp/jank/runtime/obj/transient_array_map.cpp
+      test/cpp/jank/runtime/obj/range.cpp
+      test/cpp/jank/runtime/obj/integer_range.cpp
+      test/cpp/jank/runtime/obj/repeat.cpp
+      test/cpp/jank/jit/processor.cpp
+    )
+    add_executable(jank::test_exe ALIAS jank_test_exe)
+    add_dependencies(jank_test_exe jank_core_libraries)
+    jank_hook_llvm(jank_test_exe)
+
+    if(jank_enable_phase_2)
+      target_sources(jank_test_exe PUBLIC ${jank_clojure_core_output})
+      target_compile_options(jank_test_exe PUBLIC -DJANK_PHASE_2)
+    endif()
+
+    set_property(TARGET jank_test_exe PROPERTY OUTPUT_NAME jank-test)
+
+    target_compile_features(jank_test_exe PRIVATE ${jank_cxx_standard})
+    # TODO: Check if this is still needed.
+    # A doctest issue causes some warnings: https://github.com/doctest/doctest/issues/900
+    target_compile_options(jank_test_exe PUBLIC ${jank_common_compiler_flags} ${jank_aot_compiler_flags} "-Wno-#warnings")
+    target_compile_options(jank_test_exe PRIVATE -DDOCTEST_CONFIG_SUPER_FAST_ASSERTS)
+    target_include_directories(jank_test_exe SYSTEM PRIVATE "$<TARGET_PROPERTY:jank_common_lib,INCLUDE_DIRECTORIES>")
+    target_link_directories(jank_test_exe PRIVATE "$<TARGET_PROPERTY:jank_common_lib,LINK_DIRECTORIES>")
+    target_link_options(jank_test_exe PRIVATE ${jank_linker_flags} -L ${CMAKE_BINARY_DIR})
+
+    target_link_libraries(
+      jank_test_exe PUBLIC
+      ${jank_link_whole_start} ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a ${jank_link_whole_end}
+      z
+      LLVM clang-cpp
+      OpenSSL::Crypto
+      doctest::doctest
+    )
+
+    if(WIN32)
+      target_link_libraries(
+        jank_test_exe PUBLIC
+        ${jank_link_whole_start} libclang_rt.builtins-x86_64.a ${jank_link_whole_end}
+        # Required at least for mkstemp
+        ${jank_link_whole_start} libmingwex.a ${jank_link_whole_end}
+
+        pthread
+        zstd
+      )
+    endif()
+
+    # Symbol exporting for JIT.
+    set_target_properties(jank_test_exe PROPERTIES ENABLE_EXPORTS 1)
+
+    add_dependencies(jank_test_exe jank_exe_phase_2)
+
+    add_test(NAME "Test" COMMAND jank_test_exe)
+  endif()
+  # ---- Tests ----
 endif()
-# ---- Tests ----
 
 # ---- Incremental PCH ----
 # Once we boot up jank, the first thing we do is load a PCH so that the JIT environment

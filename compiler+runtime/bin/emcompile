@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+build_dir="${here}/../build-wasm"
+
+emmake.bat cmake --build "${build_dir}" "$@"

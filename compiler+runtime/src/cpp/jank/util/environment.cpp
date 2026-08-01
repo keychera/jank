@@ -97,7 +97,7 @@ namespace jank::util
       return "";
     }
     return std::filesystem::canonical(path).string();
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__EMSCRIPTEN__) // just a workaround so it compiles
     return std::filesystem::canonical("/proc/self/exe").string();
 #elif defined(JANK_WINDOWS_LIKE)
     char path[MAX_PATH]{};
