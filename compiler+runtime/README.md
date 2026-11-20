@@ -1,5 +1,8 @@
 # jank compiler and runtime
 
+boehm now support wasm64?
+https://github.com/bdwgc/bdwgc/commit/3f4e077edb2496bfd14e625f3a440f38caac458a
+
 ## emscripten build attempts
 
 need [emscripten](https://emscripten.org/index.html)
