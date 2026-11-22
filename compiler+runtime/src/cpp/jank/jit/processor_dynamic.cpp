@@ -64,13 +64,14 @@ namespace jank::jit
 #endif
 
   static jtl::immutable_string static_lib_name(jtl::immutable_string const &lib)
-#if defined(JANK_WINDOWS_LIKE)
-  {
-    return util::format("lib{}.lib", lib);
-  }
-#else
   {
     return util::format("lib{}.a", lib);
+  }
+
+#if defined(JANK_WINDOWS_LIKE)
+  static jtl::immutable_string static_msvc_lib_name(jtl::immutable_string const &lib)
+  {
+    return util::format("lib{}.lib", lib);
   }
 #endif
 
@@ -827,7 +828,20 @@ namespace jank::jit
         result = processor::find_lib(library_dirs, stat);
         if(result.is_none())
         {
+#ifdef JANK_WINDOWS_LIKE
+          auto const &stat2{ static_msvc_lib_name(lib.substr(1)) };
+          result = processor::find_lib(library_dirs, stat2);
+          if(result.is_none())
+          {
+            return err(util::format("Failed to find library '{}'.", lib.substr(1)));
+          }
+          else
+          {
+            resolved.emplace_back(result.unwrap(), true);
+          }
+#else
           return err(util::format("Failed to find static library '{}'.", lib.substr(1)));
+#endif
         }
         else
         {
@@ -853,7 +867,20 @@ namespace jank::jit
           result = processor::find_lib(library_dirs, stat);
           if(result.is_none())
           {
+#ifdef JANK_WINDOWS_LIKE
+            auto const &stat2{ static_msvc_lib_name(lib) };
+            result = processor::find_lib(library_dirs, stat2);
+            if(result.is_none())
+            {
+              return err(util::format("Failed to find library '{}'.", lib));
+            }
+            else
+            {
+              resolved.emplace_back(result.unwrap(), true);
+            }
+#else
             return err(util::format("Failed to find library '{}'.", lib));
+#endif
           }
           else
           {
